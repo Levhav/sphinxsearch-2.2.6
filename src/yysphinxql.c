@@ -3786,6 +3786,8 @@ yyreduce:
     {
 			// everything else is pushed directly into parser within the rules
 			pParser->ToString ( pParser->m_pStmt->m_sIndex, yyvsp[-4] );
+                        if ( !pParser->ReplaceStatement ( &yyvsp[-4] ) )
+				YYERROR;
 		;}
     break;
 

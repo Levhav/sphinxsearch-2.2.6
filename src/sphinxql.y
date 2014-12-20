@@ -996,6 +996,8 @@ insert_into:
 		{
 			// everything else is pushed directly into parser within the rules
 			pParser->ToString ( pParser->m_pStmt->m_sIndex, $3 );
+                        if ( !pParser->ReplaceStatement ( &$3 ) )
+                                YYERROR;
 		}
 	;
 

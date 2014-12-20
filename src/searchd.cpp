@@ -11590,6 +11590,9 @@ public:
 	void						FreeNamedVec ( int iIndex );
 	bool						UpdateStatement ( SqlNode_t * pNode );
 	bool						DeleteStatement ( SqlNode_t * pNode );
+        
+        bool                                            InsertStatement ( SqlNode_t * pNode );
+        bool                                            ReplaceStatement ( SqlNode_t * pNode );
 
 	void						AddUpdatedAttr ( const SqlNode_t & tName, ESphAttr eType ) const;
 	void						UpdateMVAAttr ( const SqlNode_t & tName, const SqlNode_t& dValues );
@@ -12126,6 +12129,18 @@ bool SqlParser_c::UpdateStatement ( SqlNode_t * pNode )
 bool SqlParser_c::DeleteStatement ( SqlNode_t * pNode )
 {
 	GenericStatement ( pNode, STMT_DELETE );
+	return true;
+}
+
+bool SqlParser_c::InsertStatement ( SqlNode_t * pNode )
+{
+	GenericStatement ( pNode, STMT_REPLACE );
+	return true;
+}
+
+bool SqlParser_c::ReplaceStatement ( SqlNode_t * pNode )
+{
+	GenericStatement ( pNode, STMT_REPLACE );
 	return true;
 }
 
@@ -14883,302 +14898,7 @@ public:
 			m_tOut.DataTuplet ( pLeft, iRight );
 	}
 };
-
-void HandleMysqlInsert ( SqlRowBuffer_c & tOut, const SqlStmt_t & tStmt,
-	bool bReplace, bool bCommit, CSphString & sWarning )
-{
-	MEMORY ( MEM_SQL_INSERT );
-
-	CSphString sError;
-
-	// get that index
-	const ServedIndex_t * pServed = g_pLocalIndexes->GetRlockedEntry ( tStmt.m_sIndex );
-	if ( !pServed )
-	{
-		sError.SetSprintf ( "no such index '%s'", tStmt.m_sIndex.cstr() );
-		tOut.Error ( tStmt.m_sStmt, sError.cstr() );
-		return;
-	}
-
-	if ( !pServed->m_bRT || !pServed->m_bEnabled )
-	{
-		pServed->Unlock();
-		sError.SetSprintf ( "index '%s' does not support INSERT (enabled=%d)", tStmt.m_sIndex.cstr(), pServed->m_bEnabled );
-		tOut.Error ( tStmt.m_sStmt, sError.cstr() );
-		return;
-	}
-
-	ISphRtIndex * pIndex = (ISphRtIndex*)pServed->m_pIndex;
-
-	// get schema, check values count
-	const CSphSchema & tSchema = pIndex->GetInternalSchema();
-	int iSchemaSz = tSchema.GetAttrsCount() + tSchema.m_dFields.GetLength() + 1;
-	if ( pIndex->GetSettings().m_bIndexFieldLens )
-		iSchemaSz -= tSchema.m_dFields.GetLength();
-	int iExp = tStmt.m_iSchemaSz;
-	int iGot = tStmt.m_dInsertValues.GetLength();
-	if ( !tStmt.m_dInsertSchema.GetLength() && ( iSchemaSz!=tStmt.m_iSchemaSz ) )
-	{
-		pServed->Unlock();
-		sError.SetSprintf ( "column count does not match schema (expected %d, got %d)", iSchemaSz, iGot );
-		tOut.Error ( tStmt.m_sStmt, sError.cstr() );
-		return;
-	}
-
-	if ( ( iGot % iExp )!=0 )
-	{
-		pServed->Unlock();
-		sError.SetSprintf ( "column count does not match value count (expected %d, got %d)", iExp, iGot );
-		tOut.Error ( tStmt.m_sStmt, sError.cstr() );
-		return;
-	}
-
-	CSphVector<int> dAttrSchema ( tSchema.GetAttrsCount() );
-	CSphVector<int> dFieldSchema ( tSchema.m_dFields.GetLength() );
-	int iIdIndex = 0;
-	if ( !tStmt.m_dInsertSchema.GetLength() )
-	{
-		// no columns list, use index schema
-		ARRAY_FOREACH ( i, dFieldSchema )
-			dFieldSchema[i] = i+1;
-		int iFields = dFieldSchema.GetLength();
-		ARRAY_FOREACH ( j, dAttrSchema )
-			dAttrSchema[j] = j+iFields+1;
-	} else
-	{
-		// got a list of columns, check for 1) existance, 2) dupes
-		CSphVector<CSphString> dCheck = tStmt.m_dInsertSchema;
-		ARRAY_FOREACH ( i, dCheck )
-			// OPTIMIZE! GetAttrIndex and GetFieldIndex use the linear searching. M.b. hash instead?
-			if ( dCheck[i]!="id" && tSchema.GetAttrIndex ( dCheck[i].cstr() )==-1 && tSchema.GetFieldIndex ( dCheck[i].cstr() )==-1 )
-			{
-				pServed->Unlock();
-				sError.SetSprintf ( "unknown column: '%s'", dCheck[i].cstr() );
-				tOut.Error ( tStmt.m_sStmt, sError.cstr(), MYSQL_ERR_PARSE_ERROR );
-				return;
-			}
-
-		dCheck.Sort();
-		for ( int i=1; i<dCheck.GetLength(); i++ )
-			if ( dCheck[i-1]==dCheck[i] )
-			{
-				pServed->Unlock();
-				sError.SetSprintf ( "column '%s' specified twice", dCheck[i].cstr() );
-				tOut.Error ( tStmt.m_sStmt, sError.cstr(), MYSQL_ERR_FIELD_SPECIFIED_TWICE );
-				return;
-			}
-
-		// hash column list
-		// OPTIMIZE! hash index columns once (!) instead
-		SmallStringHash_T<int> dInsertSchema;
-		ARRAY_FOREACH ( i, tStmt.m_dInsertSchema )
-			dInsertSchema.Add ( i, tStmt.m_dInsertSchema[i] );
-
-		// get id index
-		if ( !dInsertSchema.Exists("id") )
-		{
-			pServed->Unlock();
-			tOut.Error ( tStmt.m_sStmt, "column list must contain an 'id' column" );
-			return;
-		}
-		iIdIndex = dInsertSchema["id"];
-
-		// map fields
-		bool bIdDupe = false;
-		ARRAY_FOREACH ( i, dFieldSchema )
-		{
-			if ( dInsertSchema.Exists ( tSchema.m_dFields[i].m_sName ) )
-			{
-				int iField = dInsertSchema[tSchema.m_dFields[i].m_sName];
-				if ( iField==iIdIndex )
-				{
-					bIdDupe = true;
-					break;
-				}
-				dFieldSchema[i] = iField;
-			} else
-				dFieldSchema[i] = -1;
-		}
-		if ( bIdDupe )
-		{
-			pServed->Unlock();
-			tOut.Error ( tStmt.m_sStmt, "fields must never be named 'id' (fix your config)" );
-			return;
-		}
-
-		// map attrs
-		ARRAY_FOREACH ( j, dAttrSchema )
-		{
-			if ( dInsertSchema.Exists ( tSchema.GetAttr(j).m_sName ) )
-			{
-				int iField = dInsertSchema[tSchema.GetAttr(j).m_sName];
-				if ( iField==iIdIndex )
-				{
-					bIdDupe = true;
-					break;
-				}
-				dAttrSchema[j] = iField;
-			} else
-				dAttrSchema[j] = -1;
-		}
-		if ( bIdDupe )
-		{
-			pServed->Unlock();
-			sError.SetSprintf ( "attributes must never be named 'id' (fix your config)" );
-			tOut.Error ( tStmt.m_sStmt, sError.cstr() );
-			return;
-		}
-	}
-
-	CSphVector<const char *> dStrings;
-	CSphVector<DWORD> dMvas;
-
-	// convert attrs
-	for ( int c=0; c<tStmt.m_iRowsAffected; c++ )
-	{
-		assert ( sError.IsEmpty() );
-
-		CSphMatchVariant tDoc;
-		tDoc.Reset ( tSchema.GetRowSize() );
-		tDoc.m_uDocID = (SphDocID_t)CSphMatchVariant::ToDocid ( tStmt.m_dInsertValues[iIdIndex + c * iExp] );
-		dStrings.Resize ( 0 );
-		dMvas.Resize ( 0 );
-
-		int iSchemaAttrCount = tSchema.GetAttrsCount();
-		if ( pIndex->GetSettings().m_bIndexFieldLens )
-			iSchemaAttrCount -= tSchema.m_dFields.GetLength();
-		for ( int i=0; i<iSchemaAttrCount; i++ )
-		{
-			// shortcuts!
-			const CSphColumnInfo & tCol = tSchema.GetAttr(i);
-			CSphAttrLocator tLoc = tCol.m_tLocator;
-			tLoc.m_bDynamic = true;
-
-			int iQuerySchemaIdx = dAttrSchema[i];
-			bool bResult;
-			if ( iQuerySchemaIdx < 0 )
-			{
-				bResult = tDoc.SetDefaultAttr ( tLoc, tCol.m_eAttrType );
-				if ( tCol.m_eAttrType==SPH_ATTR_STRING || tCol.m_eAttrType==SPH_ATTR_JSON )
-					dStrings.Add ( NULL );
-				if ( tCol.m_eAttrType==SPH_ATTR_UINT32SET || tCol.m_eAttrType==SPH_ATTR_INT64SET )
-					dMvas.Add ( 0 );
-			} else
-			{
-				const SqlInsert_t & tVal = tStmt.m_dInsertValues[iQuerySchemaIdx + c * iExp];
-
-				// sanity checks
-				if ( tVal.m_iType!=TOK_QUOTED_STRING && tVal.m_iType!=TOK_CONST_INT && tVal.m_iType!=TOK_CONST_FLOAT && tVal.m_iType!=TOK_CONST_MVA )
-				{
-					sError.SetSprintf ( "row %d, column %d: internal error: unknown insval type %d", 1+c, 1+iQuerySchemaIdx, tVal.m_iType ); // 1 for human base
-					break;
-				}
-				if ( tVal.m_iType==TOK_CONST_MVA && !( tCol.m_eAttrType==SPH_ATTR_UINT32SET || tCol.m_eAttrType==SPH_ATTR_INT64SET ) )
-				{
-					sError.SetSprintf ( "row %d, column %d: MVA value specified for a non-MVA column", 1+c, 1+iQuerySchemaIdx ); // 1 for human base
-					break;
-				}
-				if ( ( tCol.m_eAttrType==SPH_ATTR_UINT32SET || tCol.m_eAttrType==SPH_ATTR_INT64SET ) && tVal.m_iType!=TOK_CONST_MVA )
-				{
-					sError.SetSprintf ( "row %d, column %d: non-MVA value specified for a MVA column", 1+c, 1+iQuerySchemaIdx ); // 1 for human base
-					break;
-				}
-
-				// ok, checks passed; do work
-				// MVA column? grab the values
-				if ( tCol.m_eAttrType==SPH_ATTR_UINT32SET || tCol.m_eAttrType==SPH_ATTR_INT64SET )
-				{
-					// collect data from scattered insvals
-					// FIXME! maybe remove this mess, and just have a single m_dMvas pool in parser instead?
-					int iLen = 0;
-					if ( tVal.m_pVals.Ptr() )
-					{
-						tVal.m_pVals->Uniq();
-						iLen = tVal.m_pVals->GetLength();
-					}
-					if ( tCol.m_eAttrType==SPH_ATTR_INT64SET )
-					{
-						dMvas.Add ( iLen*2 );
-						for ( int j=0; j<iLen; j++ )
-						{
-							uint64_t uVal = ( *tVal.m_pVals.Ptr() )[j];
-							DWORD uLow = (DWORD)uVal;
-							DWORD uHi = (DWORD)( uVal>>32 );
-							dMvas.Add ( uLow );
-							dMvas.Add ( uHi );
-						}
-					} else
-					{
-						dMvas.Add ( iLen );
-						for ( int j=0; j<iLen; j++ )
-							dMvas.Add ( (DWORD)( *tVal.m_pVals.Ptr() )[j] );
-					}
-				}
-
-				// FIXME? index schema is lawfully static, but our temp match obviously needs to be dynamic
-				bResult = tDoc.SetAttr ( tLoc, tVal, tCol.m_eAttrType );
-				if ( tCol.m_eAttrType==SPH_ATTR_STRING || tCol.m_eAttrType==SPH_ATTR_JSON )
-					dStrings.Add ( tVal.m_sVal.cstr() );
-			}
-
-			if ( !bResult )
-			{
-				sError.SetSprintf ( "internal error: unknown attribute type in INSERT (typeid=%d)", tCol.m_eAttrType );
-				break;
-			}
-		}
-		if ( !sError.IsEmpty() )
-			break;
-
-		// convert fields
-		CSphVector<const char*> dFields;
-		ARRAY_FOREACH ( i, tSchema.m_dFields )
-		{
-			int iQuerySchemaIdx = dFieldSchema[i];
-			if ( iQuerySchemaIdx < 0 )
-				dFields.Add ( "" ); // default value
-			else
-			{
-				if ( tStmt.m_dInsertValues [ iQuerySchemaIdx + c * iExp ].m_iType!=TOK_QUOTED_STRING )
-				{
-					sError.SetSprintf ( "row %d, column %d: string expected", 1+c, 1+iQuerySchemaIdx ); // 1 for human base
-					break;
-				}
-				dFields.Add ( tStmt.m_dInsertValues[ iQuerySchemaIdx + c * iExp ].m_sVal.cstr() );
-			}
-		}
-		if ( !sError.IsEmpty() )
-			break;
-
-		// do add
-		pIndex->AddDocument ( dFields.GetLength(), dFields.Begin(), tDoc,
-			bReplace, tStmt.m_sStringParam,
-			dStrings.Begin(), dMvas, sError, sWarning );
-
-		if ( !sError.IsEmpty() )
-			break;
-	}
-
-	// fire exit
-	if ( !sError.IsEmpty() )
-	{
-		pIndex->RollBack(); // clean up collected data
-		pServed->Unlock();
-		tOut.Error ( tStmt.m_sStmt, sError.cstr() );
-		return;
-	}
-
-	// no errors so far
-	if ( bCommit )
-		pIndex->Commit ();
-
-	pServed->Unlock();
-
-	// my OK packet
-	tOut.Ok ( tStmt.m_iRowsAffected, sWarning.IsEmpty() ? 0 : 1 );
-}
-
-
+ 
 // our copy of enum_server_command
 // we can't rely on mysql_com.h because it might be unavailable
 //
@@ -15951,6 +15671,13 @@ struct SphinxqlRequestBuilder_t : public IRequestBuilder_t
 		, m_sEnd ( sQuery.cstr() + tStmt.m_iListEnd, sQuery.Length() - tStmt.m_iListEnd )
 	{
 	}
+        
+        explicit SphinxqlRequestBuilder_t ( const CSphString& sQuery, int m_iListStart, int m_iListEnd  )
+		: m_sBegin ( sQuery.cstr(), m_iListStart )
+		, m_sEnd ( sQuery.cstr() + m_iListEnd, sQuery.Length() - m_iListEnd )
+	{
+	}
+        
 	virtual void BuildRequest ( AgentConn_t & tAgent, NetOutputBuffer_c & tOut ) const;
 
 protected:
@@ -16171,6 +15898,373 @@ void HandleMysqlUpdate ( SqlRowBuffer_c & tOut, const SqlStmt_t & tStmt, const C
 	}
 
 	tOut.Ok ( iUpdated, iWarns );
+}
+
+
+void HandleMysqlInsert ( SqlRowBuffer_c & tOut, const SqlStmt_t & tStmt, bool bReplace, bool bCommit, CSphString & sWarning, const CSphString & sQuery )
+{
+	MEMORY ( MEM_SQL_INSERT );
+
+	CSphString sError;
+
+	// get that index
+	const ServedIndex_t * pServed = g_pLocalIndexes->GetRlockedEntry ( tStmt.m_sIndex );
+	if ( !pServed )
+	{
+	    // extract index names
+            CSphVector<CSphString> dIndexNames;
+            ParseIndexList ( tStmt.m_sIndex, dIndexNames );
+            if ( !dIndexNames.GetLength() )
+            {
+                    sError.SetSprintf ( "[in insert]no such index '%s'", tStmt.m_sIndex.cstr() );
+                    tOut.Error ( tStmt.m_sStmt, sError.cstr() );
+                    return;
+            }
+
+            // lock safe storage for distributed indexes
+            CSphVector<DistributedIndex_t> dDistributed ( dIndexNames.GetLength() );
+            // copy distributed indexes description
+            const char * sMissedDist = NULL;
+            if ( ( sMissedDist = ExtractDistributedIndexes ( dIndexNames, dDistributed ) )!=NULL )
+            {
+                    sError.SetSprintf ( "[in insert]unknown index '%s' in insert request", sMissedDist );
+                    tOut.Error ( tStmt.m_sStmt, sError.cstr() );
+                    return;
+            }
+            
+            // do update
+            SearchFailuresLog_c dFails;
+            int iSuccesses = 0;
+            int iUpdated = 0;
+            int iWarns = 0;
+
+            bool bMvaUpdate = false;
+            ARRAY_FOREACH_COND ( i, tStmt.m_tUpdate.m_dAttrs, !bMvaUpdate )
+            {
+                    bMvaUpdate = ( tStmt.m_tUpdate.m_dTypes[i]==SPH_ATTR_UINT32SET
+                            || tStmt.m_tUpdate.m_dTypes[i]==SPH_ATTR_INT64SET );
+            }
+
+            ARRAY_FOREACH ( iIdx, dIndexNames )
+            {
+                // update remote agents
+                if ( dDistributed[iIdx].m_dAgents.GetLength() )
+                {
+                    DistributedIndex_t & tDist = dDistributed[iIdx];
+
+                    CSphVector<AgentConn_t> dAgents;
+                    tDist.GetAllAgents ( &dAgents );
+
+                    //tStmt.m_iListStart = 12;
+                    //tStmt.m_iListEnd = 16;
+ 
+                    //printf("HandleMysqlInsert:%d-%d\n", tStmt.m_iListStart, tStmt.m_iListEnd);
+                    // connect to remote agents and query them
+                    //SphinxqlRequestBuilder_t tReqBuilder ( sQuery, tStmt );
+                    SphinxqlRequestBuilder_t tReqBuilder ( sQuery, tStmt );
+                    CSphRemoteAgentsController tDistCtrl ( g_iDistThreads, dAgents, tReqBuilder, tDist.m_iAgentConnectTimeout );
+                    int iAgentsDone = tDistCtrl.Finish();
+                    if ( iAgentsDone )
+                    {
+                            SphinxqlReplyParser_t tParser ( &iUpdated, &iWarns );
+                            iSuccesses += RemoteWaitForAgents ( dAgents, tDist.m_iAgentQueryTimeout, tParser ); // FIXME? profile update time too?
+                    }
+                }
+            }
+
+            CSphStringBuilder sReport;
+            dFails.BuildReport ( sReport );
+
+            if ( !iSuccesses )
+            {
+                    tOut.Error ( tStmt.m_sStmt, sReport.cstr() );
+                    return;
+            }
+
+            tOut.Ok ( iUpdated, iWarns );
+            return;
+	}
+	
+
+        //////////////////////////////////
+        //    Insert on local index     //
+        //////////////////////////////////
+	if ( !pServed->m_bRT || !pServed->m_bEnabled )
+	{
+		pServed->Unlock();
+		sError.SetSprintf ( "index '%s' does not support INSERT (enabled=%d)", tStmt.m_sIndex.cstr(), pServed->m_bEnabled );
+		tOut.Error ( tStmt.m_sStmt, sError.cstr() );
+		return;
+	}
+
+	ISphRtIndex * pIndex = (ISphRtIndex*)pServed->m_pIndex;
+
+	// get schema, check values count
+	const CSphSchema & tSchema = pIndex->GetInternalSchema();
+	int iSchemaSz = tSchema.GetAttrsCount() + tSchema.m_dFields.GetLength() + 1;
+	if ( pIndex->GetSettings().m_bIndexFieldLens )
+		iSchemaSz -= tSchema.m_dFields.GetLength();
+	int iExp = tStmt.m_iSchemaSz;
+	int iGot = tStmt.m_dInsertValues.GetLength();
+	if ( !tStmt.m_dInsertSchema.GetLength() && ( iSchemaSz!=tStmt.m_iSchemaSz ) )
+	{
+		pServed->Unlock();
+		sError.SetSprintf ( "column count does not match schema (expected %d, got %d)", iSchemaSz, iGot );
+		tOut.Error ( tStmt.m_sStmt, sError.cstr() );
+		return;
+	}
+
+	if ( ( iGot % iExp )!=0 )
+	{
+		pServed->Unlock();
+		sError.SetSprintf ( "column count does not match value count (expected %d, got %d)", iExp, iGot );
+		tOut.Error ( tStmt.m_sStmt, sError.cstr() );
+		return;
+	}
+
+	CSphVector<int> dAttrSchema ( tSchema.GetAttrsCount() );
+	CSphVector<int> dFieldSchema ( tSchema.m_dFields.GetLength() );
+	int iIdIndex = 0;
+	if ( !tStmt.m_dInsertSchema.GetLength() )
+	{
+		// no columns list, use index schema
+		ARRAY_FOREACH ( i, dFieldSchema )
+			dFieldSchema[i] = i+1;
+		int iFields = dFieldSchema.GetLength();
+		ARRAY_FOREACH ( j, dAttrSchema )
+			dAttrSchema[j] = j+iFields+1;
+	} else
+	{
+		// got a list of columns, check for 1) existance, 2) dupes
+		CSphVector<CSphString> dCheck = tStmt.m_dInsertSchema;
+		ARRAY_FOREACH ( i, dCheck )
+			// OPTIMIZE! GetAttrIndex and GetFieldIndex use the linear searching. M.b. hash instead?
+			if ( dCheck[i]!="id" && tSchema.GetAttrIndex ( dCheck[i].cstr() )==-1 && tSchema.GetFieldIndex ( dCheck[i].cstr() )==-1 )
+			{
+				pServed->Unlock();
+				sError.SetSprintf ( "unknown column: '%s'", dCheck[i].cstr() );
+				tOut.Error ( tStmt.m_sStmt, sError.cstr(), MYSQL_ERR_PARSE_ERROR );
+				return;
+			}
+
+		dCheck.Sort();
+		for ( int i=1; i<dCheck.GetLength(); i++ )
+			if ( dCheck[i-1]==dCheck[i] )
+			{
+				pServed->Unlock();
+				sError.SetSprintf ( "column '%s' specified twice", dCheck[i].cstr() );
+				tOut.Error ( tStmt.m_sStmt, sError.cstr(), MYSQL_ERR_FIELD_SPECIFIED_TWICE );
+				return;
+			}
+
+		// hash column list
+		// OPTIMIZE! hash index columns once (!) instead
+		SmallStringHash_T<int> dInsertSchema;
+		ARRAY_FOREACH ( i, tStmt.m_dInsertSchema )
+			dInsertSchema.Add ( i, tStmt.m_dInsertSchema[i] );
+
+		// get id index
+		if ( !dInsertSchema.Exists("id") )
+		{
+			pServed->Unlock();
+			tOut.Error ( tStmt.m_sStmt, "column list must contain an 'id' column" );
+			return;
+		}
+		iIdIndex = dInsertSchema["id"];
+
+		// map fields
+		bool bIdDupe = false;
+		ARRAY_FOREACH ( i, dFieldSchema )
+		{
+			if ( dInsertSchema.Exists ( tSchema.m_dFields[i].m_sName ) )
+			{
+				int iField = dInsertSchema[tSchema.m_dFields[i].m_sName];
+				if ( iField==iIdIndex )
+				{
+					bIdDupe = true;
+					break;
+				}
+				dFieldSchema[i] = iField;
+			} else
+				dFieldSchema[i] = -1;
+		}
+		if ( bIdDupe )
+		{
+			pServed->Unlock();
+			tOut.Error ( tStmt.m_sStmt, "fields must never be named 'id' (fix your config)" );
+			return;
+		}
+
+		// map attrs
+		ARRAY_FOREACH ( j, dAttrSchema )
+		{
+			if ( dInsertSchema.Exists ( tSchema.GetAttr(j).m_sName ) )
+			{
+				int iField = dInsertSchema[tSchema.GetAttr(j).m_sName];
+				if ( iField==iIdIndex )
+				{
+					bIdDupe = true;
+					break;
+				}
+				dAttrSchema[j] = iField;
+			} else
+				dAttrSchema[j] = -1;
+		}
+		if ( bIdDupe )
+		{
+			pServed->Unlock();
+			sError.SetSprintf ( "attributes must never be named 'id' (fix your config)" );
+			tOut.Error ( tStmt.m_sStmt, sError.cstr() );
+			return;
+		}
+	}
+
+	CSphVector<const char *> dStrings;
+	CSphVector<DWORD> dMvas;
+
+	// convert attrs
+	for ( int c=0; c<tStmt.m_iRowsAffected; c++ )
+	{
+		assert ( sError.IsEmpty() );
+
+		CSphMatchVariant tDoc;
+		tDoc.Reset ( tSchema.GetRowSize() );
+		tDoc.m_uDocID = (SphDocID_t)CSphMatchVariant::ToDocid ( tStmt.m_dInsertValues[iIdIndex + c * iExp] );
+		dStrings.Resize ( 0 );
+		dMvas.Resize ( 0 );
+
+		int iSchemaAttrCount = tSchema.GetAttrsCount();
+		if ( pIndex->GetSettings().m_bIndexFieldLens )
+			iSchemaAttrCount -= tSchema.m_dFields.GetLength();
+		for ( int i=0; i<iSchemaAttrCount; i++ )
+		{
+			// shortcuts!
+			const CSphColumnInfo & tCol = tSchema.GetAttr(i);
+			CSphAttrLocator tLoc = tCol.m_tLocator;
+			tLoc.m_bDynamic = true;
+
+			int iQuerySchemaIdx = dAttrSchema[i];
+			bool bResult;
+			if ( iQuerySchemaIdx < 0 )
+			{
+				bResult = tDoc.SetDefaultAttr ( tLoc, tCol.m_eAttrType );
+				if ( tCol.m_eAttrType==SPH_ATTR_STRING || tCol.m_eAttrType==SPH_ATTR_JSON )
+					dStrings.Add ( NULL );
+				if ( tCol.m_eAttrType==SPH_ATTR_UINT32SET || tCol.m_eAttrType==SPH_ATTR_INT64SET )
+					dMvas.Add ( 0 );
+			} else
+			{
+				const SqlInsert_t & tVal = tStmt.m_dInsertValues[iQuerySchemaIdx + c * iExp];
+
+				// sanity checks
+				if ( tVal.m_iType!=TOK_QUOTED_STRING && tVal.m_iType!=TOK_CONST_INT && tVal.m_iType!=TOK_CONST_FLOAT && tVal.m_iType!=TOK_CONST_MVA )
+				{
+					sError.SetSprintf ( "row %d, column %d: internal error: unknown insval type %d", 1+c, 1+iQuerySchemaIdx, tVal.m_iType ); // 1 for human base
+					break;
+				}
+				if ( tVal.m_iType==TOK_CONST_MVA && !( tCol.m_eAttrType==SPH_ATTR_UINT32SET || tCol.m_eAttrType==SPH_ATTR_INT64SET ) )
+				{
+					sError.SetSprintf ( "row %d, column %d: MVA value specified for a non-MVA column", 1+c, 1+iQuerySchemaIdx ); // 1 for human base
+					break;
+				}
+				if ( ( tCol.m_eAttrType==SPH_ATTR_UINT32SET || tCol.m_eAttrType==SPH_ATTR_INT64SET ) && tVal.m_iType!=TOK_CONST_MVA )
+				{
+					sError.SetSprintf ( "row %d, column %d: non-MVA value specified for a MVA column", 1+c, 1+iQuerySchemaIdx ); // 1 for human base
+					break;
+				}
+
+				// ok, checks passed; do work
+				// MVA column? grab the values
+				if ( tCol.m_eAttrType==SPH_ATTR_UINT32SET || tCol.m_eAttrType==SPH_ATTR_INT64SET )
+				{
+					// collect data from scattered insvals
+					// FIXME! maybe remove this mess, and just have a single m_dMvas pool in parser instead?
+					int iLen = 0;
+					if ( tVal.m_pVals.Ptr() )
+					{
+						tVal.m_pVals->Uniq();
+						iLen = tVal.m_pVals->GetLength();
+					}
+					if ( tCol.m_eAttrType==SPH_ATTR_INT64SET )
+					{
+						dMvas.Add ( iLen*2 );
+						for ( int j=0; j<iLen; j++ )
+						{
+							uint64_t uVal = ( *tVal.m_pVals.Ptr() )[j];
+							DWORD uLow = (DWORD)uVal;
+							DWORD uHi = (DWORD)( uVal>>32 );
+							dMvas.Add ( uLow );
+							dMvas.Add ( uHi );
+						}
+					} else
+					{
+						dMvas.Add ( iLen );
+						for ( int j=0; j<iLen; j++ )
+							dMvas.Add ( (DWORD)( *tVal.m_pVals.Ptr() )[j] );
+					}
+				}
+
+				// FIXME? index schema is lawfully static, but our temp match obviously needs to be dynamic
+				bResult = tDoc.SetAttr ( tLoc, tVal, tCol.m_eAttrType );
+				if ( tCol.m_eAttrType==SPH_ATTR_STRING || tCol.m_eAttrType==SPH_ATTR_JSON )
+					dStrings.Add ( tVal.m_sVal.cstr() );
+			}
+
+			if ( !bResult )
+			{
+				sError.SetSprintf ( "internal error: unknown attribute type in INSERT (typeid=%d)", tCol.m_eAttrType );
+				break;
+			}
+		}
+		if ( !sError.IsEmpty() )
+			break;
+
+		// convert fields
+		CSphVector<const char*> dFields;
+		ARRAY_FOREACH ( i, tSchema.m_dFields )
+		{
+			int iQuerySchemaIdx = dFieldSchema[i];
+			if ( iQuerySchemaIdx < 0 )
+				dFields.Add ( "" ); // default value
+			else
+			{
+				if ( tStmt.m_dInsertValues [ iQuerySchemaIdx + c * iExp ].m_iType!=TOK_QUOTED_STRING )
+				{
+					sError.SetSprintf ( "row %d, column %d: string expected", 1+c, 1+iQuerySchemaIdx ); // 1 for human base
+					break;
+				}
+				dFields.Add ( tStmt.m_dInsertValues[ iQuerySchemaIdx + c * iExp ].m_sVal.cstr() );
+			}
+		}
+		if ( !sError.IsEmpty() )
+			break;
+
+		// do add
+		pIndex->AddDocument ( dFields.GetLength(), dFields.Begin(), tDoc,
+			bReplace, tStmt.m_sStringParam,
+			dStrings.Begin(), dMvas, sError, sWarning );
+
+		if ( !sError.IsEmpty() )
+			break;
+	}
+
+	// fire exit
+	if ( !sError.IsEmpty() )
+	{
+		pIndex->RollBack(); // clean up collected data
+		pServed->Unlock();
+		tOut.Error ( tStmt.m_sStmt, sError.cstr() );
+		return;
+	}
+
+	// no errors so far
+	if ( bCommit )
+		pIndex->Commit ();
+
+	pServed->Unlock();
+
+	// my OK packet
+	tOut.Ok ( tStmt.m_iRowsAffected, sWarning.IsEmpty() ? 0 : 1 );
 }
 
 bool HandleMysqlSelect ( SqlRowBuffer_c & dRows, SearchHandler_c & tHandler )
@@ -18101,7 +18195,7 @@ public:
 			m_tLastMeta.m_sError = m_sError;
 			m_tLastMeta.m_sWarning = "";
 			HandleMysqlInsert ( tOut, *pStmt, eStmt==STMT_REPLACE,
-				m_tVars.m_bAutoCommit && !m_tVars.m_bInTransaction, m_tLastMeta.m_sWarning );
+				m_tVars.m_bAutoCommit && !m_tVars.m_bInTransaction, m_tLastMeta.m_sWarning, sQuery );
 			return true;
 
 		case STMT_DELETE:
@@ -23287,3 +23381,4 @@ int main ( int argc, char **argv )
 //
 // $Id: searchd.cpp 4841 2014-11-12 06:03:55Z kevg $
 //
+
